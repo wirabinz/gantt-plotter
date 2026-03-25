@@ -3,7 +3,7 @@ from src.utils.gantt_utils import load_tasks, group_tasks_by_group, plot_gantt
 def main():
     
     file_path = 'data/project_tasks.xlsx'
-    output_path = None
+    output_path = 'output/gantt_chart.png'
     
     # Excel file specs
     sheet_name = 'data'
