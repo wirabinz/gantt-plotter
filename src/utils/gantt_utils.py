@@ -388,9 +388,7 @@ def build_schedule_anchor_text(task):
 # =========================
 # GANTT PLOTTING
 # =========================
-# =========================
-# REPAIRED GANTT PLOTTING (Labels on Right, Original X-Axis Logic Restored)
-# =========================
+
 def plot_gantt(tasks, output_path=None, show=True, return_fig=False, figsize=(14, 8)):
     if tasks.empty:
         print("No tasks to plot.")
@@ -625,7 +623,10 @@ def plot_gantt_weekly(tasks, output_path=None, show=True, return_fig=False, figs
 # =========================
 # WEEKLY ROLE DEMAND
 # =========================
-def build_weekly_role_demand(tasks):
+# =========================
+# REPAIRED DAILY ROLE LOGIC
+# =========================
+def build_daily_role_demand(tasks):
     if tasks.empty:
         return pd.DataFrame()
 
@@ -641,6 +642,7 @@ def build_weekly_role_demand(tasks):
 
     daily_records = []
 
+    # Logic preserved: check every day for active tasks per role
     for day in all_days:
         for role in roles:
             active = tasks[
@@ -651,47 +653,81 @@ def build_weekly_role_demand(tasks):
 
             daily_records.append({
                 "date": day,
-                "week_start": day - pd.Timedelta(days=day.weekday()),
                 "role": role,
-                "active_tasks": len(active)
+                "people_needed": len(active) # Daily count
             })
 
-    daily_df = pd.DataFrame(daily_records)
+    return pd.DataFrame(daily_records)
+# =========================
+# DAILY ROLE DEMAND (Custom Color Palette)
+# =========================
 
-    weekly_df = (
-        daily_df.groupby(["week_start", "role"], as_index=False)["active_tasks"]
-        .max()
-        .rename(columns={"active_tasks": "people_needed"})
-    )
-
-    weekly_df["week_end"] = weekly_df["week_start"] + pd.Timedelta(days=6)
-    weekly_df["week_label"] = weekly_df["week_start"].apply(
-        lambda d: f"{d.strftime('%b')} W{((d.day - 1)//7)+1}"
-    )
-
-    return weekly_df.sort_values(by=["week_start", "role"]).reset_index(drop=True)
+# Updated Template Colors with a matching 4th color
+TEMPLATE_COLORS_LIST = [
+    "#56778f",  # Muted Blue
+    "#91be6f",  # Sage Green
+    "#ff6e61",  # Coral/Salmon
+    "#6c5b7b"   # Slate Plum (Matches the saturation of the others)
+]
 
 
-def plot_weekly_role_demand(tasks, output_path=None, show=True, return_fig=False, figsize=(14, 6)):
-    demand_df = build_weekly_role_demand(tasks)
+def plot_daily_role_demand(tasks, output_path=None, show=True, return_fig=False, figsize=(14, 6)):
+    demand_df = build_daily_role_demand(tasks) 
 
     if demand_df.empty:
         print("No demand data to plot.")
         return
 
-    pivot = demand_df.pivot(index="week_label", columns="role", values="people_needed").fillna(0)
+    # Pivot: index="date", columns="role", values="people_needed"
+    pivot = demand_df.pivot(index="date", columns="role", values="people_needed").fillna(0)
+
+    # Logic: Match colors to the number of roles
+    # We cycle the list in case there are more roles than colors defined
+    n_roles = len(pivot.columns)
+    plot_colors = [TEMPLATE_COLORS_LIST[i % len(TEMPLATE_COLORS_LIST)] for i in range(n_roles)]
 
     fig, ax = plt.subplots(figsize=figsize)
-    pivot.plot(kind="bar", ax=ax)
 
-    ax.set_title("Weekly Peak Role Demand", fontsize=TITLE_SIZE, color=FONT_COLOR, fontweight=TITLE_FONT_WEIGHT)
-    ax.set_xlabel("Week")
-    ax.set_ylabel("Peak People Needed")
-    ax.tick_params(axis='x', rotation=45)
-    ax.grid(axis='y', linestyle='--', alpha=0.4)
+    # --- STYLE: Grouped Vertical Bars ---
+    pivot.plot(kind="bar", 
+               ax=ax, 
+               stacked=False, 
+               width=0.8, 
+               color=plot_colors,
+               edgecolor='white', 
+               linewidth=0.4, 
+               alpha=0.9)
 
+    # --- MATCHING GANTT STYLE ---
+    ax.set_title("Daily Role Demand", 
+                 fontsize=TITLE_SIZE, 
+                 color=FONT_COLOR, 
+                 fontweight=TITLE_FONT_WEIGHT)
+    
+    ax.set_xlabel("Date", fontsize=LABEL_SIZE, color=FONT_COLOR)
+    ax.set_ylabel("People Needed", fontsize=LABEL_SIZE, color=FONT_COLOR)
+
+    # X-AXIS CLEANUP: Thining labels to prevent overlap
+    # Shows roughly 10-12 labels across the whole chart
+    n = max(1, len(pivot) // 12)  
+    indices = range(0, len(pivot), n)
+    ax.set_xticks(indices)
+    ax.set_xticklabels([pivot.index[i].strftime('%d/%b') for i in indices], 
+                       rotation=45, ha='right', fontsize=9, color=FONT_COLOR)
+
+    # Styling consistent with Gantt Chart
+    ax.grid(axis='y', linestyle='--', alpha=0.3, linewidth=0.8)
     for spine in ['top', 'right']:
         ax.spines[spine].set_visible(False)
+    
+    ax.tick_params(axis='y', labelsize=9, colors=FONT_COLOR)
+    
+    # Force Y-axis to use integers (you can't have half a person)
+    from matplotlib.ticker import MaxNLocator
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Legend outside to the right
+    ax.legend(title="Roles", framealpha=0.8, loc='upper left', bbox_to_anchor=(1, 1), fontsize=9)
 
     plt.tight_layout()
 
