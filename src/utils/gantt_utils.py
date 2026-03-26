@@ -1,3 +1,5 @@
+from cmath import rect
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -35,21 +37,76 @@ rcParams['axes.labelsize'] = LABEL_SIZE
 # LOADING FUNCTIONS
 # =========================
 def load_project_sheet(file_path, sheet_name="PROJECT"):
+    """
+    Load PROJECT sheet.
+
+    Supports either:
+    - deadline mode
+    - startline mode
+    - mixed mode
+
+    Required base columns:
+    - project_name
+    - template_name
+
+    Optional scheduling columns:
+    - deadline
+    - startline
+
+    Optional:
+    - buffer_days
+    """
     projects = pd.read_excel(file_path, sheet_name=sheet_name)
     projects.columns = [str(c).strip() for c in projects.columns]
 
-    required = ["project_name", "template_name", "deadline", "buffer_days"]
-    missing = [c for c in required if c not in projects.columns]
-    if missing:
-        raise ValueError(f"Missing columns in PROJECT sheet: {missing}")
+    # Base required columns
+    required_base = ["project_name", "template_name"]
+    missing_base = [c for c in required_base if c not in projects.columns]
+    if missing_base:
+        raise ValueError(f"Missing required columns in PROJECT sheet: {missing_base}")
+
+    # At least one scheduling anchor must exist
+    if "deadline" not in projects.columns and "startline" not in projects.columns:
+        raise ValueError(
+            "PROJECT sheet must contain at least one of: 'deadline' or 'startline'"
+        )
 
     projects = projects.dropna(how="all").copy()
     projects = projects[projects["project_name"].notna()].copy()
 
     projects["project_name"] = projects["project_name"].astype(str).str.strip()
     projects["template_name"] = projects["template_name"].astype(str).str.strip()
-    projects["deadline"] = pd.to_datetime(projects["deadline"])
-    projects["buffer_days"] = pd.to_numeric(projects["buffer_days"], errors="coerce").fillna(0).astype(int)
+
+    # Optional columns
+    if "deadline" in projects.columns:
+        projects["deadline"] = pd.to_datetime(projects["deadline"], errors="coerce")
+    else:
+        projects["deadline"] = pd.NaT
+
+    if "startline" in projects.columns:
+        projects["startline"] = pd.to_datetime(projects["startline"], errors="coerce")
+    else:
+        projects["startline"] = pd.NaT
+
+    if "buffer_days" in projects.columns:
+        projects["buffer_days"] = (
+            pd.to_numeric(projects["buffer_days"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
+    else:
+        projects["buffer_days"] = 0
+
+    # Row-level validation: each row must have either deadline or startline
+    invalid_rows = projects[
+        projects["deadline"].isna() & projects["startline"].isna()
+    ]
+
+    if not invalid_rows.empty:
+        raise ValueError(
+            "Some PROJECT rows have neither 'deadline' nor 'startline':\n"
+            + invalid_rows[["project_name", "template_name"]].to_string(index=False)
+        )
 
     return projects
 
@@ -200,11 +257,27 @@ def calculate_backward_anchored_schedule(tasks, deadline, buffer_days=0):
 
     return tasks.sort_values(by=["start_date", "task_id"]).reset_index(drop=True)
 
+def calculate_forward_from_startline(tasks, startline, buffer_days=0):
+    """
+    Forward scheduling anchored to a given startline.
+
+    Logic:
+    - Tasks start as early as possible
+    - Dependencies respected
+    - Parallel branches allowed
+    - Buffer shifts actual work start forward
+    """
+    startline = pd.to_datetime(startline)
+    effective_start = startline + pd.Timedelta(days=buffer_days)
+
+    scheduled = calculate_forward_schedule(tasks, start_date=effective_start)
+
+    return scheduled.sort_values(by=["start_date", "task_id"]).reset_index(drop=True)
 
 # =========================
 # PROJECT BUILDERS
 # =========================
-def build_project_schedule(file_path, project_row):
+def build_project_schedule_backward(file_path, project_row):
     project_name = project_row["project_name"]
     template_name = project_row["template_name"]
     deadline = project_row["deadline"]
@@ -225,21 +298,55 @@ def build_project_schedule(file_path, project_row):
     ]
     return scheduled[cols]
 
+def build_project_schedule_forward(file_path, project_row):
+    """
+    Build schedule using startline instead of deadline.
+    """
+    project_name = project_row["project_name"]
+    template_name = project_row["template_name"]
+    startline = project_row["startline"]
+    buffer_days = project_row.get("buffer_days", 0)
 
-def build_master_schedule(file_path, project_sheet="PROJECT"):
-    projects = load_project_sheet(file_path, project_sheet)
+    tasks = load_template_sheet(file_path, template_name)
+    scheduled = calculate_forward_from_startline(tasks, startline, buffer_days)
 
-    all_schedules = []
+    scheduled["project_name"] = project_name
+    scheduled["template_name"] = template_name
+    scheduled["startline"] = startline
+    scheduled["buffer_days"] = buffer_days
+
+    cols = [
+        "project_name", "template_name", "task_id", "dependencies", "task_group",
+        "task_description", "duration_days", "role",
+        "start_date", "end_date", "startline", "buffer_days"
+    ]
+
+    return scheduled[cols]
+
+
+def build_master_schedule(file_path):
+    projects = load_project_sheet(file_path)
+    all_projects = []
+
     for _, row in projects.iterrows():
-        schedule = build_project_schedule(file_path, row)
-        all_schedules.append(schedule)
 
-    if not all_schedules:
-        return pd.DataFrame()
+        if pd.notna(row.get("deadline")):
+            schedule = build_project_schedule(file_path, row)
 
-    master = pd.concat(all_schedules, ignore_index=True)
-    master = master.sort_values(by=["project_name", "template_name", "start_date", "task_id"]).reset_index(drop=True)
-    return master
+        elif pd.notna(row.get("startline")):
+            schedule = build_project_schedule_forward(file_path, row)
+
+        else:
+            raise ValueError(
+                f"Project '{row.get('project_name')}' / template '{row.get('template_name')}' "
+                f"must have either deadline or startline."
+            )
+
+        all_projects.append(schedule)
+
+    master = pd.concat(all_projects, ignore_index=True)
+
+    return master.sort_values(by=["start_date", "project_name", "task_id"]).reset_index(drop=True)
 
 
 # =========================
@@ -259,9 +366,30 @@ def prepare_gantt_labels(tasks):
     )
     return tasks
 
+def build_schedule_anchor_text(task):
+    """
+    Safely builds schedule anchor info for hover annotation.
+    Supports both deadline mode and startline mode.
+    """
+    lines = []
+
+    if "deadline" in task.index and pd.notna(task["deadline"]):
+        lines.append(f"Deadline: {pd.to_datetime(task['deadline']).strftime('%d/%b/%Y')}")
+
+    if "startline" in task.index and pd.notna(task["startline"]):
+        lines.append(f"Startline: {pd.to_datetime(task['startline']).strftime('%d/%b/%Y')}")
+
+    if "buffer_days" in task.index and pd.notna(task["buffer_days"]):
+        lines.append(f"Buffer: {int(task['buffer_days'])} days")
+
+    return "\n".join(lines)
+
 
 # =========================
 # GANTT PLOTTING
+# =========================
+# =========================
+# REPAIRED GANTT PLOTTING (Labels on Right, Original X-Axis Logic Restored)
 # =========================
 def plot_gantt(tasks, output_path=None, show=True, return_fig=False, figsize=(14, 8)):
     if tasks.empty:
@@ -275,22 +403,38 @@ def plot_gantt(tasks, output_path=None, show=True, return_fig=False, figsize=(14
     ).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=figsize)
-    bars = []
+    # Adjust margins to fit labels on the right
+    plt.subplots_adjust(right=0.85, left=0.2) 
 
-    for _, task in tasks.iterrows():
+    bars = []
+    y_positions = []
+    
+    # Track unique project-template combinations for group separators
+    group_markers = {}
+    
+    for idx, (_, task) in enumerate(tasks.iterrows()):
         duration = (task["end_date"] - task["start_date"]).days + 1
         color = TEMPLATE_COLORS.get(task["template_name"], BAR_COLOR)
-        y_label = f"{task.project_name} | {task.short_label}"
-
+        
+        group_key = f"{task.project_name}|{task.template_name}"
+        
         bar = ax.barh(
-            y_label,
+            idx,
             width=duration,
             left=task["start_date"],
             height=0.6,
             color=color
         )
+        y_positions.append(idx)
+
+        # Mark group boundaries
+        if group_key not in group_markers:
+            group_markers[group_key] = {'start_idx': idx, 'end_idx': idx}
+        else:
+            group_markers[group_key]['end_idx'] = idx
 
         for rect in bar:
+            anchor_text = build_schedule_anchor_text(task)
             rect.annotation = (
                 f"Project: {task.project_name}\n"
                 f"Template: {task.template_name}\n"
@@ -300,66 +444,83 @@ def plot_gantt(tasks, output_path=None, show=True, return_fig=False, figsize=(14
                 f"Role: {task.role}\n"
                 f"Start: {task.start_date.strftime('%d/%b/%Y')}\n"
                 f"End: {task.end_date.strftime('%d/%b/%Y')}\n"
-                f"Duration: {duration} days\n"
-                f"Deadline: {task.deadline.strftime('%d/%b/%Y')}"
+                f"Duration: {duration} days"
+                + (f"\n{anchor_text}" if anchor_text else "")
             )
             bars.append(rect)
 
-    cursor = mplcursors.cursor(bars, hover=mplcursors.HoverMode.Transient)
+    # --- RESTORED X-AXIS & DATE RANGE LOGIC ---
+    start_date = tasks["start_date"].min() - pd.Timedelta(days=3)
+    end_date = tasks["end_date"].max() + pd.Timedelta(days=3)
+    ax.set_xlim(start_date, end_date)
+    
+    total_days = (end_date - start_date).days
+    if total_days <= 30:
+        major_freq, minor_freq, major_format = 'D', 'D', '%d/%b'
+    elif total_days <= 90:
+        major_freq, minor_freq, major_format = '3D', 'D', '%d/%b'
+    else:
+        major_freq, minor_freq, major_format = 'W-MON', 'D', '%d/%b'
+    
+    major_ticks = pd.date_range(start=start_date, end=end_date, freq=major_freq)
+    ax.set_xticks(major_ticks)
+    ax.set_xticklabels([d.strftime(major_format) for d in major_ticks], 
+                       fontsize=DAY_FONT_SIZE, color=FONT_COLOR, rotation=45, ha='right')
+    
+    if minor_freq:
+        ax.set_xticks(pd.date_range(start=start_date, end=end_date, freq=minor_freq), minor=True)
+    
+    # Secondary x-axis with month/year view
+    sec_ax = ax.secondary_xaxis('bottom')
+    sec_ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
+    sec_ax.xaxis.set_major_locator(mdates.MonthLocator())
+    sec_ax.tick_params(axis='x', labelsize=MONTH_FONT_SIZE, colors=FONT_COLOR)
+    sec_ax.spines['bottom'].set_position(('outward', 35))
+    sec_ax.xaxis.set_minor_locator(mdates.WeekdayLocator())
 
+    # --- NEW CLEAN Y-AXIS (Task on Left, Project/Template on Right) ---
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(tasks["task_group"], fontsize=9, color=FONT_COLOR)
+
+    for proj in tasks["project_name"].unique():
+        proj_df = tasks[tasks["project_name"] == proj]
+        mid_proj = proj_df.index.min() + (proj_df.index.max() - proj_df.index.min()) / 2
+        # Project Label
+        ax.text(1.12, mid_proj, proj, transform=ax.get_yaxis_transform(), 
+                ha='center', va='center', fontweight='bold', fontsize=10, rotation=270)
+        
+        for temp in proj_df["template_name"].unique():
+            temp_df = proj_df[proj_df["template_name"] == temp]
+            mid_temp = temp_df.index.min() + (temp_df.index.max() - temp_df.index.min()) / 2
+            # Template Label
+            ax.text(1.04, mid_temp, temp, transform=ax.get_yaxis_transform(), 
+                    ha='center', va='center', fontsize=9, rotation=270)
+            
+            # Horizontal Separator
+            ax.axhline(y=temp_df.index.max() + 0.5, color='gray', linestyle='-', linewidth=0.8, alpha=0.5)
+
+    # --- FINAL STYLING ---
+    ax.set_title(TITLE, fontsize=TITLE_SIZE, color=FONT_COLOR).set_fontweight(TITLE_FONT_WEIGHT)
+    ax.set_xlabel(X_LABEL, fontsize=LABEL_SIZE, color=FONT_COLOR)
+    ax.grid(axis='x', which='major', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax.grid(axis='x', which='minor', linestyle=':', alpha=0.2, linewidth=0.5)
+    
+    for spine in ['top', 'right']:
+        ax.spines[spine].set_visible(False)
+        sec_ax.spines[spine].set_visible(False)
+
+    ax.invert_yaxis()
+    
+    cursor = mplcursors.cursor(bars, hover=mplcursors.HoverMode.Transient)
     @cursor.connect("add")
     def on_hover(sel):
         sel.annotation.set_text(sel.artist.annotation)
         sel.annotation.get_bbox_patch().set(facecolor="white", alpha=0.9)
         sel.annotation.set_fontsize(9)
 
-    start_date = tasks["start_date"].min() - pd.Timedelta(days=3)
-    end_date = tasks["end_date"].max() + pd.Timedelta(days=3)
-
-    week_positions, week_labels = build_week_ticks(start_date, end_date)
-
-    ax.set_xlim(start_date, end_date)
-    ax.set_xticks(week_positions)
-    ax.set_xticklabels(week_labels, fontsize=DAY_FONT_SIZE, color=FONT_COLOR)
-
-    ax.set_title(TITLE, fontsize=TITLE_SIZE, color=FONT_COLOR).set_fontweight(TITLE_FONT_WEIGHT)
-    ax.set_xlabel(X_LABEL, fontsize=LABEL_SIZE, color=FONT_COLOR)
-    ax.set_ylabel("")
-    ax.tick_params(axis='both', colors=FONT_COLOR)
-    ax.grid(axis='x', linestyle='--', alpha=0.4)
-
-    sec_ax = ax.secondary_xaxis('bottom')
-    sec_ax.xaxis.set_major_formatter(mdates.DateFormatter('%b/%y'))
-    sec_ax.xaxis.set_major_locator(mdates.MonthLocator())
-    sec_ax.tick_params(axis='x', labelsize=MONTH_FONT_SIZE, colors=FONT_COLOR)
-    sec_ax.spines['bottom'].set_position(('outward', 20))
-
-    for label in sec_ax.get_xticklabels():
-        label.set_fontsize(MONTH_FONT_SIZE)
-        label.set_weight(MONTH_FONT_WEIGHT)
-        label.set_color(FONT_COLOR)
-
-    for spine in ['top', 'right']:
-        ax.spines[spine].set_visible(False)
-        sec_ax.spines[spine].set_visible(False)
-
-    ax.invert_yaxis()
-
-    handles = [mpatches.Patch(color=color, label=template) for template, color in TEMPLATE_COLORS.items()]
-    ax.legend(handles=handles, loc='best', framealpha=0.8)
-
     plt.tight_layout()
-
-    if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-
-    if show:
-        plt.show()
-    else:
-        plt.close()
-
-    if return_fig:
-        return fig, ax
+    if show: plt.show()
+    if return_fig: return fig, ax
 
 
 def plot_gantt_weekly(tasks, output_path=None, show=True, return_fig=False, figsize=(15, 8)):
@@ -374,86 +535,91 @@ def plot_gantt_weekly(tasks, output_path=None, show=True, return_fig=False, figs
     ).reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=figsize)
-    bars = []
+    
+    # Adjust right margin to make room for the new labels
+    plt.subplots_adjust(right=0.85) 
 
-    for _, task in tasks.iterrows():
+    bars = []
+    y_positions = []
+    
+    for idx, (_, task) in enumerate(tasks.iterrows()):
         duration = (task["end_date"] - task["start_date"]).days + 1
         color = TEMPLATE_COLORS.get(task["template_name"], BAR_COLOR)
-        y_label = f"{task.project_name} | {task.short_label}"
+        
+        bar = ax.barh(idx, width=duration, left=task["start_date"], height=0.6, color=color)
+        y_positions.append(idx)
 
-        bar = ax.barh(
-            y_label,
-            width=duration,
-            left=task["start_date"],
-            height=0.6,
-            color=color
-        )
-
+        # Preserved hover logic
         for rect in bar:
+            anchor_text = build_schedule_anchor_text(task)
             rect.annotation = (
                 f"Project: {task.project_name}\n"
                 f"Template: {task.template_name}\n"
-                f"Task ID: {task.task_id}\n"
                 f"Task Group: {task.task_group}\n"
-                f"Description: {task.task_description}\n"
-                f"Role: {task.role}\n"
                 f"Start: {task.start_date.strftime('%d/%b/%Y')}\n"
-                f"End: {task.end_date.strftime('%d/%b/%Y')}\n"
-                f"Duration: {duration} days\n"
-                f"Deadline: {task.deadline.strftime('%d/%b/%Y')}"
+                f"End: {task.end_date.strftime('%d/%b/%Y')}"
             )
             bars.append(rect)
 
-    cursor = mplcursors.cursor(bars, hover=mplcursors.HoverMode.Transient)
+    # --- UPDATED Y-AXIS LABELING ---
+    # Left Side: Only show the specific Task Group
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(tasks["task_group"], fontsize=9, color=FONT_COLOR)
 
+    # Right Side: Project and Template Labels
+    for proj in tasks["project_name"].unique():
+        proj_df = tasks[tasks["project_name"] == proj]
+        mid_proj = proj_df.index.min() + (proj_df.index.max() - proj_df.index.min()) / 2
+        
+        # Project Label (Far Right)
+        ax.text(1.12, mid_proj, proj, transform=ax.get_yaxis_transform(), 
+                ha='center', va='center', fontweight='bold', fontsize=10, rotation=270)
+        
+        for temp in proj_df["template_name"].unique():
+            temp_df = proj_df[proj_df["template_name"] == temp]
+            mid_temp = temp_df.index.min() + (temp_df.index.max() - temp_df.index.min()) / 2
+            
+            # Template Label (Inside Right)
+            ax.text(1.04, mid_temp, temp, transform=ax.get_yaxis_transform(), 
+                    ha='center', va='center', fontsize=9, rotation=270)
+            
+            # Separator line to keep groups distinct
+            ax.axhline(y=temp_df.index.max() + 0.5, color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+
+    # Visual separators for the right-side "Table"
+    ax.annotate('', xy=(1.08, 0), xycoords='axes fraction', xytext=(1.08, 1), 
+                arrowprops=dict(arrowstyle="-", color='black', alpha=0.2))
+    ax.annotate('', xy=(1.16, 0), xycoords='axes fraction', xytext=(1.16, 1), 
+                arrowprops=dict(arrowstyle="-", color='black', alpha=0.2))
+
+    # --- PRESERVED X-AXIS & STYLE LOGIC ---
+    start_date = tasks["start_date"].min() - pd.Timedelta(days=3)
+    end_date = tasks["end_date"].max() + pd.Timedelta(days=3)
+    ax.set_xlim(start_date, end_date)
+
+    weekly_ticks = pd.date_range(start=start_date, end=end_date, freq="W-MON")
+    ax.set_xticks(weekly_ticks)
+    ax.set_xticklabels([f"{d.strftime('%b %d')}-{(d+pd.Timedelta(days=6)).strftime('%d')}" for d in weekly_ticks], 
+                       rotation=45, ha='right', fontsize=9, color=FONT_COLOR)
+    
+    ax.set_xticks(pd.date_range(start=start_date, end=end_date, freq="D"), minor=True)
+    ax.grid(axis='x', which='major', linestyle='--', alpha=0.4)
+    ax.grid(axis='x', which='minor', linestyle=':', alpha=0.2)
+
+    ax.set_title(f"{TITLE} (Weekly View)", fontsize=TITLE_SIZE, fontweight=TITLE_FONT_WEIGHT)
+    ax.invert_yaxis()
+
+    # Tooltip activation
+    cursor = mplcursors.cursor(bars, hover=mplcursors.HoverMode.Transient)
     @cursor.connect("add")
     def on_hover(sel):
         sel.annotation.set_text(sel.artist.annotation)
         sel.annotation.get_bbox_patch().set(facecolor="white", alpha=0.9)
-        sel.annotation.set_fontsize(9)
-
-    start_date = tasks["start_date"].min() - pd.Timedelta(days=3)
-    end_date = tasks["end_date"].max() + pd.Timedelta(days=3)
-
-    ax.set_xlim(start_date, end_date)
-
-    weekly_ticks = pd.date_range(start=start_date, end=end_date, freq="W-MON")
-
-    def week_label(d):
-        week_num = ((d.day - 1) // 7) + 1
-        return f"{d.strftime('%b')} W{week_num}"
-
-    weekly_labels = [week_label(d) for d in weekly_ticks]
-
-    ax.set_xticks(weekly_ticks)
-    ax.set_xticklabels(weekly_labels, rotation=45, ha='right', fontsize=9, color=FONT_COLOR)
-
-    ax.set_title(f"{TITLE} (Weekly View)", fontsize=TITLE_SIZE, color=FONT_COLOR).set_fontweight(TITLE_FONT_WEIGHT)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    ax.tick_params(axis='both', colors=FONT_COLOR)
-    ax.grid(axis='x', linestyle='--', alpha=0.4)
-
-    for spine in ['top', 'right']:
-        ax.spines[spine].set_visible(False)
-
-    ax.invert_yaxis()
-
-    handles = [mpatches.Patch(color=color, label=template) for template, color in TEMPLATE_COLORS.items()]
-    ax.legend(handles=handles, loc='best', framealpha=0.8)
 
     plt.tight_layout()
-
-    if output_path:
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-
-    if show:
-        plt.show()
-    else:
-        plt.close()
-
-    if return_fig:
-        return fig, ax
+    if output_path: plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    if show: plt.show()
+    if return_fig: return fig, ax
 
 
 # =========================
