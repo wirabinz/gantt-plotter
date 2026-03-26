@@ -329,23 +329,25 @@ def build_master_schedule(file_path):
     all_projects = []
 
     for _, row in projects.iterrows():
-
+        # Check for Deadline (Backward Logic)
         if pd.notna(row.get("deadline")):
-            schedule = build_project_schedule(file_path, row)
+            # FIX: Point to the backward builder
+            schedule = build_project_schedule_backward(file_path, row) 
 
+        # Check for Startline (Forward Logic)
         elif pd.notna(row.get("startline")):
             schedule = build_project_schedule_forward(file_path, row)
 
         else:
             raise ValueError(
-                f"Project '{row.get('project_name')}' / template '{row.get('template_name')}' "
-                f"must have either deadline or startline."
+                f"Project '{row.get('project_name')}' must have either deadline or startline."
             )
 
         all_projects.append(schedule)
 
     master = pd.concat(all_projects, ignore_index=True)
 
+    # Sort so the whole master list is chronological
     return master.sort_values(by=["start_date", "project_name", "task_id"]).reset_index(drop=True)
 
 
